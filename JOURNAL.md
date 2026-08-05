@@ -54,7 +54,7 @@ None for the fix itself. Worth noting though, that `make check` and `make test-u
 
 ### Check-in 2 (end of week)
 
-**PR link:** [link to your submitted pull request]
+**PR link:** https://github.com/AnniecTW/pathreview/pull/1
 
 **Branch:** `fix/6-duplicate-embeddings-issue`
 

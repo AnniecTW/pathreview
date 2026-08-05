@@ -1,18 +1,40 @@
-"""Reproduction test for issue #6: duplicate embeddings on re-ingestion.
+"""Regression test for issue #6: re-ingesting the same source must be skipped."""
 
-NOTE: This asserts the BROKEN behavior on purpose.
-"""
+from typing import Any
 
 import pytest
 
 from ingestion.embeddings.provider import MockEmbeddingProvider
-from ingestion.pipeline import IngestionPipeline
+from ingestion.pipeline import IngestionPipeline, IngestResult
 
 README = """# My Project
 
 ## Overview
 This is a sample project that does useful things with data pipelines.
 """
+
+OTHER_README = """# My Project
+
+## Overview
+A completely different description about machine learning workflows.
+"""
+
+RESUME = """# Jane Doe
+
+## Experience
+Software Engineer at TechCorp, building REST APIs with Python and FastAPI.
+
+## Skills
+Python, JavaScript, PostgreSQL, Docker.
+"""
+
+REPO_DATA = {
+    "name": "my-repo",
+    "description": "A sample project for testing ingestion.",
+    "language": "Python",
+    "stargazers_count": 12,
+    "html_url": "https://github.com/prof-1/my-repo",
+}
 
 
 class FakeVectorDB:
@@ -33,16 +55,50 @@ class FakeVectorDB:
         self.added_ids.extend(ids)
 
 
-class FakeAsyncSession:
-    """Mimics the real core.database AsyncSession, which has no .query()."""
+class FakeResult:
+    """Minimal stand-in for a SQLAlchemy Result."""
 
-    def query(self, *args: object, **kwargs: object) -> None:
-        raise AttributeError("'AsyncSession' object has no attribute 'query'")
+    def __init__(self, records: list[object]) -> None:
+        self._records = records
+
+    def scalars(self) -> "FakeResult":
+        return self
+
+    def first(self) -> object | None:
+        return self._records[0] if self._records else None
+
+
+class FakeAsyncSession:
+    """Stateful stand-in that honours the WHERE clause like a real database."""
+
+    def __init__(self) -> None:
+        self.records: list = []
+
+    async def execute(self, stmt: Any) -> FakeResult:
+        # Pull the (column == value) pairs out of the WHERE clause so this fake
+        # filters the way a real database would
+        clause = stmt.whereclause
+        comparisons = getattr(clause, "clauses", [clause]) if clause is not None else []
+        criteria = {cmp.left.key: cmp.right.value for cmp in comparisons}
+
+        matched = [
+            record
+            for record in self.records
+            if all(getattr(record, column) == value for column, value in criteria.items())
+        ]
+        return FakeResult(matched)
+
+    def add(self, obj: object) -> None:
+        self.records.append(obj)
+
+    async def commit(self) -> None:
+        pass
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
 class TestIngestionPipelineDeduplication:
-    """Reproduces the duplicate-embeddings bug at the pipeline level."""
+    """Re-ingesting the same source should be skipped, with no duplicate vectors."""
 
     @pytest.fixture
     def vector_db(self) -> FakeVectorDB:
@@ -56,21 +112,55 @@ class TestIngestionPipelineDeduplication:
             embedding_provider=MockEmbeddingProvider(),
         )
 
-    def test_reingesting_same_content_creates_duplicates(
+    def _assert_deduplicated(
+        self, first: IngestResult, second: IngestResult, vector_db: FakeVectorDB
+    ) -> None:
+        assert first.skipped is False
+        assert second.skipped is True
+        assert first.source_id == second.source_id
+        assert vector_db.add_calls == first.chunk_count
+        assert len(vector_db.added_ids) == len(set(vector_db.added_ids))
+
+    async def test_reingesting_same_readme_is_skipped(
         self, pipeline: IngestionPipeline, vector_db: FakeVectorDB
     ) -> None:
-        """Re-ingesting identical content should be skipped, but currently is not."""
-        first = pipeline.ingest_readme(profile_id="prof-1", repo_name="my-repo", content=README)
-        second = pipeline.ingest_readme(profile_id="prof-1", repo_name="my-repo", content=README)
+        first = await pipeline.ingest_readme(
+            profile_id="prof-1", repo_name="my-repo", content=README
+        )
+        second = await pipeline.ingest_readme(
+            profile_id="prof-1", repo_name="my-repo", content=README
+        )
+        self._assert_deduplicated(first, second, vector_db)
 
-        # Same content -> same deterministic source_id both times.
-        assert first.source_id == second.source_id
+    async def test_reingesting_same_resume_is_skipped(
+        self, pipeline: IngestionPipeline, vector_db: FakeVectorDB
+    ) -> None:
+        first = await pipeline.ingest_resume(
+            profile_id="prof-1", content=RESUME, filename="resume.md"
+        )
+        second = await pipeline.ingest_resume(
+            profile_id="prof-1", content=RESUME, filename="resume.md"
+        )
+        self._assert_deduplicated(first, second, vector_db)
 
-        # BUG: the second ingest is NOT skipped (should be True after the fix).
+    async def test_reingesting_same_repo_is_skipped(
+        self, pipeline: IngestionPipeline, vector_db: FakeVectorDB
+    ) -> None:
+        first = await pipeline.ingest_repo_metadata(profile_id="prof-1", repo_data=REPO_DATA)
+        second = await pipeline.ingest_repo_metadata(profile_id="prof-1", repo_data=REPO_DATA)
+        self._assert_deduplicated(first, second, vector_db)
+
+    async def test_different_content_is_not_skipped(
+        self, pipeline: IngestionPipeline, vector_db: FakeVectorDB
+    ) -> None:
+        first = await pipeline.ingest_readme(
+            profile_id="prof-1", repo_name="my-repo", content=README
+        )
+        second = await pipeline.ingest_readme(
+            profile_id="prof-1", repo_name="my-repo", content=OTHER_README
+        )
+        # Different content -> different hash -> NOT a duplicate
         assert first.skipped is False
         assert second.skipped is False
-
-        # BUG: identical vector ids were written twice -> duplicates in the store.
-        assert vector_db.add_calls == 2 * first.chunk_count
-        unique_ids = set(vector_db.added_ids)
-        assert len(vector_db.added_ids) == 2 * len(unique_ids)
+        assert first.source_id != second.source_id
+        assert vector_db.add_calls == first.chunk_count + second.chunk_count
